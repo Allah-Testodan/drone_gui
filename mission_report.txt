@@ -1,8 +1,10 @@
 Mission Report:
-Commands Executed: 5
-/connect
+Commands Executed: 7
 /help
-/disconnect
 /clear
-hej
+/help
+ai_assist
+/ai_predict_battery
+/connect
+/disconnect
 Mission Completed Successfully.
