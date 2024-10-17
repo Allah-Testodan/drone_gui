@@ -12,6 +12,8 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 import openai
 import sys
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
 
 try:
     import yaml
@@ -30,17 +32,20 @@ else:
         'port': 'COM3',
         'baudrate': 9600,
         'default_altitude': 50,
-        'safety_altitude': 20
+        'safety_altitude': 20,
+        'log_level': 'DEBUG'  # Add configurable logging level
     }
 
-# Enable logging to a file for easier debugging
-logging.basicConfig(filename='drone_controller.log', level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+# Configure logging
+log_level = config.get('log_level', 'DEBUG').upper()
+logging.basicConfig(filename='drone_controller.log', level=getattr(logging, log_level, logging.DEBUG),
+                    format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Initialize OpenAI API
 api_key = "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"
 if not api_key:
     raise openai.error.AuthenticationError(
-        "No API key provided. You can set your API key in code using 'openai.api_key = <API-KEY>', or you can set the environment variable OPENAI_API_KEY=<API-KEY>). If your API key is stored in a file, you can point the openai module at it with 'openai.api_key_path = <PATH>'. You can generate API keys in the OpenAI web interface. See https://platform.openai.com/account/api-keys for details."
+        "No API key provided. Set your OpenAI API key."
     )
 openai.api_key = api_key
 
@@ -64,28 +69,13 @@ class PIDController:
             dt = 1e-16  # Avoid division by zero
 
         error = self.setpoint - current_value
-        self.adjust_gains(error, dt)
-
         self.integral += error * dt
         derivative = (error - self.previous_error) / dt
-
         control_value = self.Kp * error + self.Ki * self.integral + self.Kd * derivative
-
         self.previous_error = error
         self.last_time = current_time
 
         return control_value
-
-    def adjust_gains(self, error, dt):
-        error_magnitude = abs(error)
-        derivative = (error - self.previous_error) / dt
-        derivative_magnitude = abs(derivative)
-
-        self.Kp = self.base_Kp * (1 + 0.5 * error_magnitude / max(self.setpoint, 1))
-        self.Kd = self.base_Kd * (1 + 0.5 * derivative_magnitude / max(error_magnitude, 1))
-
-        self.Kp = max(0.1 * self.base_Kp, min(10 * self.base_Kp, self.Kp))
-        self.Kd = max(0.1 * self.base_Kd, min(10 * self.base_Kd, self.Kd))
 
 class DroneController:
     def __init__(self):
@@ -104,6 +94,7 @@ class DroneController:
         self.command_queue = queue.Queue()
         self.last_ai_suggestion = ''
         self.command_index = None  # For navigating command history
+        self.aliases = {}  # Command Aliases
         self.shortcuts = {}  # For custom shortcuts
         self.offline_command_queue = []  # For offline mode
         self.connected = False
@@ -111,20 +102,143 @@ class DroneController:
         self.executor = ThreadPoolExecutor()
         self.altitude_shutdown_event = threading.Event()
 
-        self.run_gui_interface()
+        asyncio.run(self.run_gui_interface())
         self.start_altitude_thread()
+        self.start_health_check_thread()
+        self.setup_live_plot()
 
-    def connect_to_drone(self):
+    async def run_gui_interface(self):
+        self.root = tk.Tk()
+        self.root.title("Drone Command Interface")
+        self.root.geometry("1000x700")
+        self.root.configure(bg="#0F0F0F")
+
+        # Observation field (read-only)
+        self.observation_field = scrolledtext.ScrolledText(self.root, wrap=tk.WORD, width=70, height=15,
+                                                           bg="#0F0F0F", fg="#00FF00", font=("Courier", 12),
+                                                           state='disabled')
+        self.observation_field.pack(pady=10)
+
+        # Command entry field
+        self.command_entry = tk.Entry(self.root, bg="#0F0F0F", fg="#00FF00", font=("Courier", 12),
+                                      insertbackground="#00FF00")
+        self.command_entry.pack(pady=10, fill=tk.X)
+        self.command_entry.bind("<Return>", self.process_terminal_command)
+        self.command_entry.bind("<Tab>", self.auto_complete_command)
+        self.root.bind("<Up>", self.previous_command)
+        self.root.bind("<Down>", self.next_command)
+        self.root.bind("<Right>", self.insert_ai_suggestion)
+
+        self.status_label = tk.Label(self.root, text="Status: Idle", bg="#0F0F0F", fg="#00FF00", font=("Courier", 12))
+        self.status_label.pack(pady=5)
+
+        self.battery_gauge = Canvas(self.root, width=200, height=200, bg="#0F0F0F", highlightthickness=0)
+        self.battery_gauge.pack(side=tk.LEFT, padx=20)
+        self.update_battery_gauge(100)
+
+        self.rotor_speed_gauge = Canvas(self.root, width=200, height=200, bg="#0F0F0F", highlightthickness=0)
+        self.rotor_speed_gauge.pack(side=tk.RIGHT, padx=20)
+        self.update_rotor_speed_gauge(0)
+
+        self.altitude_label = tk.Label(self.root, text="Altitude: 0 cm", bg="#0F0F0F", fg="#00FF00", font=("Courier", 12))
+        self.altitude_label.pack(pady=5)
+
+        self.progress_label = tk.Label(self.root, text="Progress: Idle", bg="#0F0F0F", fg="#00FF00", font=("Courier", 12))
+        self.progress_label.pack(pady=5)
+
+        self.progress_bar = ttk.Progressbar(self.root, style="green.Horizontal.TProgressbar", length=400, mode='determinate')
+        self.progress_bar.pack(pady=10)
+        style = ttk.Style()
+        style.theme_use('default')
+        style.configure("green.Horizontal.TProgressbar", troughcolor='#0F0F0F', background='#00FF00', bordercolor="#0F0F0F")
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.root.mainloop()
+
+    def setup_live_plot(self):
+        self.fig, self.ax = plt.subplots()
+        self.ax.set_xlim(0, 100)
+        self.ax.set_ylim(0, 100)
+        self.line, = self.ax.plot([], [], lw=2)
+        self.xdata, self.ydata = [], []
+
+    def update_live_plot(self, i):
+        # Simulate dynamic data; replace with real sensor data.
+        altitude = random.randint(0, 100)
+        self.xdata.append(i)
+        self.ydata.append(altitude)
+        self.line.set_data(self.xdata, self.ydata)
+        return self.line,
+
+    def run_live_plot(self):
+        ani = FuncAnimation(self.fig, self.update_live_plot, frames=100, interval=1000, blit=True)
+        plt.show()
+
+    async def ai_assist(self, command):
+        command_to_assist = command.replace('/ai_assist', '').strip()
+        if not command_to_assist:
+            self.log_message("Please specify a command to get assistance with.")
+            return
+        prompt = f"Assist with command: {command_to_assist}"
+        await self.get_ai_assistance_async(prompt)
+
+    async def get_ai_assistance_async(self, prompt):
         try:
-            self.arduino = serial.Serial(self.port, self.baudrate, timeout=1)
-            self.update_status("Connected")
-            self.log_message("Connected to drone.")
-            self.connected = True
-            self.process_offline_commands()
-        except serial.SerialException as e:
-            self.log_message(f"Connection failed: {e}")
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None, 
+                lambda: openai.ChatCompletion.create(
+                    model="gpt-3.5-turbo",
+                    messages=[{"role": "system", "content": "You are an assistant helping with drone commands."}, {"role": "user", "content": prompt}],
+                    max_tokens=100
+                )
+            )
+            suggestion = response.choices[0].message['content'].strip()
+            self.log_message(f"AI Assistance: {suggestion}")
+        except Exception as e:
+            self.log_message(f"Error fetching AI assistance: {e}")
+            logging.error(f"OpenAI API error: {e}")
+
+    def ai_optimize_flight(self, optimization_goal=None):
+        if optimization_goal is None:
+            optimization_goal = "maximizing battery efficiency and stability"
+        prompt = f"Optimize the flight parameters for a drone, focusing on {optimization_goal}."
+    
+        # Updated to use gpt-3.5-turbo model
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "system", "content": "You are an assistant helping to optimize drone flight."}, 
+                      {"role": "user", "content": prompt}],
+            max_tokens=150
+        )
+    
+        optimization_suggestions = response.choices[0].message['content'].strip()
+        self.log_message(f"Flight Optimization Suggestions: {optimization_suggestions}")
+        self.update_progress("Flight optimization suggestions provided")
+
+    def connect_to_drone(self, retries=3):
+        attempt = 0
+        while attempt < retries:
+            try:
+                self.arduino = serial.Serial(self.port, self.baudrate, timeout=1)
+                self.update_status("Connected")
+                self.log_message("Connected to drone.")
+                self.connected = True
+                self.process_offline_commands()
+                break
+            except serial.SerialException as e:
+                attempt += 1
+                self.log_message(f"Connection failed: {e}. Retrying ({retries - attempt} attempts left)")
+                logging.error(f"Serial exception occurred: {e}")
+                time.sleep(2)  # Delay between retries
+            except Exception as e:
+                self.log_message(f"An unexpected error occurred: {e}")
+                logging.error(f"Unexpected error: {e}")
+                break
+        else:
+            self.log_message("Failed to connect after multiple attempts.")
+            self.update_status("Failed to Connect")
             self.connected = False
-            raise e
 
     def disconnect_drone(self):
         if self.arduino:
@@ -137,15 +251,6 @@ class DroneController:
             self.update_status("Disconnected")
             self.log_message("Disconnected from drone.")
 
-    def send_command(self, command, message):
-        try:
-            if self.arduino:
-                self.arduino.write(command.encode('utf-8'))
-            self.log_message(message)
-        except Exception as e:
-            self.log_message(f"Error: {e}")
-            logging.error(f"Error sending command: {e}")
-
     def takeoff(self):
         if not self.landing_in_progress:
             self.in_flight = True
@@ -157,30 +262,41 @@ class DroneController:
             self.update_status("In Flight")
 
     def land(self):
-        if self.in_flight:
-            self.landing_in_progress = True
-            if self.connected:
-                self.send_command('LAND\n', "Landing initiated")
-                self.update_progress("Landing in progress")
+        if not self.in_flight:
+            self.log_message("Drone is not in flight!")
+            return
+        if self.current_altitude <= self.safety_altitude:
+            self.log_message(f"Altitude ({self.current_altitude} cm) is already below safety level ({self.safety_altitude} cm). No landing needed.")
+            return
+        self.landing_in_progress = True
+        self.send_command('LAND\n', "Landing initiated")
+        self.update_progress("Landing in progress")
+        self.update_status("Landing")
+        self.in_flight = False
+
+    def send_command(self, command, message):
+        try:
+            if self.arduino:
+                self.log_message(f"Sending command: {command}")
+                self.update_progress(f"Command '{command}' in progress...")
+                self.arduino.write(command.encode('utf-8'))
+                self.update_progress(f"Command '{command}' sent successfully.")
             else:
-                self.queue_offline_command('LAND', "Landing queued")
-            self.in_flight = False
-            self.update_status("Landing")
+                self.log_message("Error: Not connected to drone.")
+                self.update_progress("Failed to send command: Not connected.")
+        except Exception as e:
+            self.log_message(f"Error: {e}")
+            self.update_progress(f"Command '{command}' failed.")
+            logging.error(f"Error sending command: {e}")
 
-    def update_altitude(self, altitude):
-        self.desired_altitude = altitude
-        self.pid_controller.setpoint = altitude
-        if self.connected:
-            self.log_message(f"Altitude set to {altitude} cm")
-            self.update_progress(f"Setting altitude to {altitude} cm")
-        else:
-            self.queue_offline_command(f'SET_ALTITUDE {altitude}', f"Altitude set to {altitude} cm queued")
-
-    def check_battery_status(self):
-        battery_status = random.randint(0, 100)
-        self.log_message(f"Battery status: {battery_status}%")
-        self.update_battery_gauge(battery_status)
-        self.update_progress("Battery status checked")
+    def check_battery(self):
+        battery_level = random.randint(0, 100)  # Replace with actual battery level reading
+        self.log_message(f"Battery Level: {battery_level}%")
+        if battery_level < 20:
+            self.log_message("Battery is below 20%, initiating landing.")
+            self.land()
+        elif battery_level < 50:
+            self.log_message("Warning: Battery is below 50%.")
 
     def calibrate_sensors(self):
         self.log_message("Calibrating sensors...")
@@ -211,46 +327,31 @@ class DroneController:
                 self.send_command(f'SET_THRUST {control_signal}\n', f"Adjusting thrust: {control_signal}")
             time.sleep(0.05)  # Increased loop frequency for faster response
 
-    def run_gui_interface(self):
-        self.root = tk.Tk()
-        self.root.title("Drone Command Interface")
-        self.root.geometry("1000x700")
-        self.root.configure(bg="#0F0F0F")
+    def start_health_check_thread(self):
+        self.health_check_event = threading.Event()
+        threading.Thread(target=self.health_check_loop, daemon=True).start()
 
-        self.terminal = scrolledtext.ScrolledText(self.root, wrap=tk.WORD, width=70, height=15, bg="#0F0F0F", fg="#00FF00", font=("Courier", 12), insertbackground="#00FF00")
-        self.terminal.pack(pady=10)
-        self.terminal.bind("<Return>", self.process_terminal_command)
-        self.terminal.bind("<Tab>", self.auto_complete_command)
-        self.root.bind("<Up>", self.previous_command)
-        self.root.bind("<Down>", self.next_command)
-        self.root.bind("<Right>", self.insert_ai_suggestion)
+    def health_check_loop(self):
+        while not self.health_check_event.is_set():
+            motor_status = random.choice(["OK", "Error"])
+            self.log_message(f"Motor Status: {motor_status}")
+            sensor_status = random.choice(["OK", "Error"])
+            self.log_message(f"Sensor Status: {sensor_status}")
+            time.sleep(10)  # Check every 10 seconds
 
-        self.status_label = tk.Label(self.root, text="Status: Idle", bg="#0F0F0F", fg="#00FF00", font=("Courier", 12))
-        self.status_label.pack(pady=5)
-
-        self.battery_gauge = Canvas(self.root, width=200, height=200, bg="#0F0F0F", highlightthickness=0)
-        self.battery_gauge.pack(side=tk.LEFT, padx=20)
-        self.update_battery_gauge(100)
-
-        self.rotor_speed_gauge = Canvas(self.root, width=200, height=200, bg="#0F0F0F", highlightthickness=0)
-        self.rotor_speed_gauge.pack(side=tk.RIGHT, padx=20)
-        self.update_rotor_speed_gauge(0)
-
-        self.altitude_label = tk.Label(self.root, text="Altitude: 0 cm", bg="#0F0F0F", fg="#00FF00", font=("Courier", 12))
-        self.altitude_label.pack(pady=5)
-
-        self.progress_label = tk.Label(self.root, text="Progress: Idle", bg="#0F0F0F", fg="#00FF00", font=("Courier", 12))
-        self.progress_label.pack(pady=5)
-
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-        self.root.mainloop()
+    def update_progress_bar(self, value):
+        self.progress_bar['value'] = value
+        self.progress_bar.update()
 
     def process_terminal_command(self, event):
-        command = self.terminal.get("end-2l", "end-1c").strip()
+        command = self.command_entry.get().strip()
         if command:
-            self.terminal.insert(tk.END, "\n")
             self.command_history.append(command)
             self.command_index = None
+
+            self.observation_field.config(state='normal')
+            self.observation_field.insert(tk.END, f"> {command}\n")
+            self.observation_field.config(state='disabled')
 
             if command.startswith('/alias '):
                 try:
@@ -291,7 +392,7 @@ class DroneController:
                 except IndexError:
                     self.log_message("Usage: /condition <condition>")
             elif command == '/battery_status':
-                self.check_battery_status()
+                self.check_battery()
             elif command == '/calibrate':
                 self.calibrate_sensors()
             elif command == '/log_status':
@@ -313,7 +414,7 @@ class DroneController:
             elif command == '/set_safety_altitude':
                 self.set_safety_altitude()
             elif command == '/ai_assist':
-                self.ai_assist(command)
+                asyncio.create_task(self.ai_assist(command))
             elif command == '/ai_optimize':
                 self.ai_optimize_flight()
             elif command == '/ai_predict_battery':
@@ -323,125 +424,35 @@ class DroneController:
             else:
                 self.log_message(f"Unknown command: {command}")
 
-        self.terminal.insert(tk.END, "\n")
-        self.lock_cursor_position()
-
-    def ai_assist(self, command):
-        # Extract the specific command user wants assistance with
-        command_to_assist = command.replace('/ai_assist', '').strip()
-        if not command_to_assist:
-            self.log_message("Please specify a command to get assistance with.")
-            return
-    
-        prompt = f"Assist with command: {command_to_assist}"
-    
-        # Run the OpenAI request in a separate thread
-        self.executor.submit(self.get_ai_assistance, prompt)
-
-    def get_ai_assistance(self, prompt):
-        try:
-            response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "You are an assistant helping with drone commands."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=100
-            )
-            suggestion = response.choices[0].message['content'].strip()
-            self.log_message(f"AI Assistance: {suggestion}")
-        except Exception as e:
-            self.log_message(f"Error fetching AI assistance: {e}")
-            logging.error(f"OpenAI API error: {e}")
-
-    def ai_optimize_flight(self):
-        prompt = "Optimize the flight parameters for a drone to achieve maximum efficiency and stability."
-        response = openai.Completion.create(
-            engine="text-davinci-003",
-            prompt=prompt,
-            max_tokens=150
-        )
-        optimization_suggestions = response.choices[0].text.strip()
-        self.log_message(f"Flight Optimization Suggestions: {optimization_suggestions}")
-        self.update_progress("Flight optimization suggestions provided")
-
-    def ai_predict_battery_life(self):
-        prompt = "Predict the remaining battery life for a drone given current usage patterns."
-        response = openai.Completion.create(
-            engine="text-davinci-003",
-            prompt=prompt,
-            max_tokens=50
-        )
-        prediction = response.choices[0].text.strip()
-        self.log_message(f"Battery Life Prediction: {prediction}")
-        self.update_progress("Battery life prediction provided")
-
-    def ai_health_check(self):
-        prompt = "Perform a health check on all drone systems including sensors, motors, and battery."
-        response = openai.Completion.create(
-            engine="text-davinci-003",
-            prompt=prompt,
-            max_tokens=100
-        )
-        health_check_report = response.choices[0].text.strip()
-        self.log_message(f"Health Check Report: {health_check_report}")
-        self.update_progress("Health check completed")
-
-    def process_terminal_command_internal(self, command):
-        self.terminal.insert(tk.END, f"{command}\n")
-        self.process_terminal_command(None)
-
-    def previous_command(self, event):
-        if self.command_history:
-            if self.command_index is None:
-                self.command_index = len(self.command_history)
-            if self.command_index > 0:
-                self.command_index -= 1
-                previous_command = self.command_history[self.command_index]
-                self.terminal.delete("end-1l", "end-1c")
-                self.terminal.insert(tk.END, previous_command)
-                self.lock_cursor_position()
-
-    def next_command(self, event):
-        if self.command_history:
-            if self.command_index is not None and self.command_index < len(self.command_history) - 1:
-                self.command_index += 1
-                next_command = self.command_history[self.command_index]
-                self.terminal.delete("end-1l", "end-1c")
-                self.terminal.insert(tk.END, next_command)
-            else:
-                self.command_index = len(self.command_history)
-                self.terminal.delete("end-1l", "end-1c")
-            self.lock_cursor_position()
-
-    def insert_ai_suggestion(self, event):
-        if self.last_ai_suggestion:
-            # Clear current input line and insert the AI suggestion
-            self.terminal.delete("end-2l", "end-1l")
-            self.terminal.insert(tk.END, self.last_ai_suggestion + "\n")
-            self.lock_cursor_position()
+            self.command_entry.delete(0, tk.END)
 
     def auto_complete_command(self, event):
-        command_prefix = self.terminal.get("end-2l", "end-1c").strip()
-        matching_commands = [cmd for cmd in ["/takeoff", "/land", "/altitude", "/connect", "/disconnect", "/condition", "/battery_status", "/calibrate", "/log_status", "/reset", "/clear", "/ai_suggest", "/set_safety_altitude", "/emergency_land", "/ai_assist", "/ai_optimize", "/ai_predict_battery", "/ai_health_check"] if cmd.startswith(command_prefix)]
+        command_prefix = self.command_entry.get().strip()
+        matching_commands = [
+            cmd for cmd in ["/takeoff", "/land", "/altitude", "/connect", "/disconnect", "/condition", "/battery_status", "/calibrate", "/log_status", "/reset", "/clear", "/ai_suggest", "/set_safety_altitude", "/emergency_land", "/ai_assist", "/ai_optimize", "/ai_predict_battery", "/ai_health_check"] + list(self.aliases.keys())
+            if cmd.startswith(command_prefix)
+        ]
         if len(matching_commands) == 1:
-            self.terminal.delete("end-2l", "end-1c")
-            self.terminal.insert(tk.END, matching_commands[0])
+            self.command_entry.delete(0, tk.END)
+            self.command_entry.insert(tk.END, matching_commands[0])
         return "break"
 
     def lock_cursor_position(self):
-        self.terminal.mark_set(tk.INSERT, "end-1c")
-        self.terminal.see(tk.INSERT)
+        self.command_entry.icursor(tk.END)
 
     def reset_terminal(self):
-        self.terminal.delete(1.0, tk.END)
+        self.observation_field.config(state='normal')
+        self.observation_field.delete(1.0, tk.END)
+        self.observation_field.config(state='disabled')
         self.command_history = []
         self.command_index = None
         self.log_message("Terminal has been reset.")
         self.update_progress("Terminal reset")
 
     def clear_terminal(self):
-        self.terminal.delete(1.0, tk.END)
+        self.observation_field.config(state='normal')
+        self.observation_field.delete(1.0, tk.END)
+        self.observation_field.config(state='disabled')
         self.log_message("Terminal output cleared.")
         self.update_progress("Terminal output cleared")
 
@@ -477,9 +488,78 @@ Available commands:
         self.log_message(help_text)
         self.update_progress("Help displayed")
 
+    def previous_command(self, event):
+        if self.command_history:
+            if self.command_index is None:
+                self.command_index = len(self.command_history)
+            if self.command_index > 0:
+                self.command_index -= 1
+                previous_command = self.command_history[self.command_index]
+                self.command_entry.delete(0, tk.END)
+                self.command_entry.insert(tk.END, previous_command)
+                self.lock_cursor_position()
+
+    def next_command(self, event):
+        if self.command_history:
+            if self.command_index is not None and self.command_index < len(self.command_history) - 1:
+                self.command_index += 1
+                next_command = self.command_history[self.command_index]
+                self.command_entry.delete(0, tk.END)
+                self.command_entry.insert(tk.END, next_command)
+            else:
+                self.command_index = len(self.command_history)
+                self.command_entry.delete(0, tk.END)
+            self.lock_cursor_position()
+
+    def insert_ai_suggestion(self, event):
+        if self.last_ai_suggestion:
+            # Clear current input line and insert the AI suggestion
+            self.command_entry.delete(0, tk.END)
+            self.command_entry.insert(tk.END, self.last_ai_suggestion + "\n")
+            self.lock_cursor_position()
+
+    def update_battery_gauge(self, percentage):
+        self.battery_gauge.delete("all")
+        self.battery_gauge.create_oval(10, 10, 190, 190, outline="#00FF00", width=4)
+        self.battery_gauge.create_arc(10, 10, 190, 190, start=90, extent=-percentage * 3.6, outline="#00FF00", style="arc", width=8)
+        self.battery_gauge.create_text(100, 100, text=f"{percentage}%", fill="#00FF00", font=("Courier", 14))
+        self.battery_gauge = Canvas(self.root, width=200, height=200, bg="#0F0F0F", highlightthickness=0, highlightbackground="#0F0F0F")
+
+    def update_rotor_speed_gauge(self, speed):
+        self.rotor_speed_gauge.delete("all")
+        self.rotor_speed_gauge.create_oval(10, 10, 190, 190, outline="#00FF00", width=4)
+        self.rotor_speed_gauge.create_arc(10, 10, 190, 190, start=90, extent=-speed * 3.6, outline="#00FF00", style="arc", width=8)
+        self.rotor_speed_gauge.create_text(100, 100, text=f"{speed} RPM", fill="#00FF00", font=("Courier", 14))
+        self.rotor_speed_gauge = Canvas(self.root, width=200, height=200, bg="#0F0F0F", highlightthickness=0, highlightbackground="#0F0F0F")
+
+    def set_safety_altitude(self):
+        self.safety_altitude = config['safety_altitude']
+        self.log_message(f"Safety altitude set to {self.safety_altitude} cm")
+        self.update_progress(f"Safety altitude set to {self.safety_altitude} cm")
+
+    def emergency_land(self):
+        self.log_message("Emergency landing initiated!")
+        self.send_command('LAND\n', "Emergency landing initiated")
+        self.in_flight = False
+        self.update_status("Emergency Landing")
+        self.update_progress("Emergency landing in progress")
+
+    def queue_offline_command(self, command, message):
+        self.offline_command_queue.append(command)
+        self.log_message(message)
+        self.update_progress(f"Command queued: {command}")
+
+    def process_offline_commands(self):
+        while self.offline_command_queue:
+            command = self.offline_command_queue.pop(0)
+            self.send_command(command + '\n', f"Executed queued command: {command}")
+        self.update_progress("Offline commands processed")
+
     def log_message(self, message):
-        self.terminal.insert(tk.END, f"{message}\n")
-        self.terminal.see(tk.END)
+        self.observation_field.config(state='normal')
+        self.observation_field.insert(tk.END, f"{message}\n")
+        self.observation_field.see(tk.END)
+        self.observation_field.config(state='disabled')
         logging.info(message)
 
     def update_status(self, status):
@@ -502,41 +582,6 @@ Available commands:
             report_file.write(report)
         self.log_message("Mission report generated.")
         self.update_progress("Mission report generated")
-
-    def update_battery_gauge(self, percentage):
-        self.battery_gauge.delete("all")
-        self.battery_gauge.create_oval(10, 10, 190, 190, outline="#00FF00", width=4)
-        self.battery_gauge.create_arc(10, 10, 190, 190, start=90, extent=-percentage * 3.6, outline="#00FF00", style="arc", width=8)
-        self.battery_gauge.create_text(100, 100, text=f"{percentage}%", fill="#00FF00", font=("Courier", 14))
-
-    def update_rotor_speed_gauge(self, speed):
-        self.rotor_speed_gauge.delete("all")
-        self.rotor_speed_gauge.create_oval(10, 10, 190, 190, outline="#00FF00", width=4)
-        self.rotor_speed_gauge.create_arc(10, 10, 190, 190, start=90, extent=-speed * 3.6, outline="#00FF00", style="arc", width=8)
-        self.rotor_speed_gauge.create_text(100, 100, text=f"{speed} RPM", fill="#00FF00", font=("Courier", 14))
-
-    def queue_offline_command(self, command, message):
-        self.offline_command_queue.append(command)
-        self.log_message(message)
-        self.update_progress(f"Command queued: {command}")
-
-    def process_offline_commands(self):
-        while self.offline_command_queue:
-            command = self.offline_command_queue.pop(0)
-            self.send_command(command + '\n', f"Executed queued command: {command}")
-        self.update_progress("Offline commands processed")
-
-    def set_safety_altitude(self):
-        self.safety_altitude = config['safety_altitude']
-        self.log_message(f"Safety altitude set to {self.safety_altitude} cm")
-        self.update_progress(f"Safety altitude set to {self.safety_altitude} cm")
-
-    def emergency_land(self):
-        self.log_message("Emergency landing initiated!")
-        self.send_command('LAND\n', "Emergency landing initiated")
-        self.in_flight = False
-        self.update_status("Emergency Landing")
-        self.update_progress("Emergency landing in progress")
 
 if __name__ == "__main__":
     try:
