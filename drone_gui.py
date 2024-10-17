@@ -1,330 +1,403 @@
-# -*- coding: utf-8 -*- 
 import serial
-import tkinter as tk
-from tkinter import ttk, messagebox
-from tkinter import PhotoImage
 import time
+import joblib
+import logging
 import threading
-import math
+import tkinter as tk
+from tkinter import scrolledtext, Canvas, ttk
+import queue
+import random
+
+# Enable logging to a file for easier debugging
+logging.basicConfig(filename='drone_controller.log', level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+
+class PIDController:
+    def __init__(self, Kp, Ki, Kd, setpoint=0):
+        self.base_Kp = Kp
+        self.base_Ki = Ki
+        self.base_Kd = Kd
+        self.Kp = Kp
+        self.Ki = Ki
+        self.Kd = Kd
+        self.setpoint = setpoint
+        self.integral = 0
+        self.previous_error = 0
+        self.last_time = time.time()
+
+    def update(self, current_value):
+        current_time = time.time()
+        dt = current_time - self.last_time
+        if dt <= 0.0:
+            dt = 1e-16  # Avoid division by zero
+
+        error = self.setpoint - current_value
+        self.adjust_gains(error, dt)
+
+        self.integral += error * dt
+        derivative = (error - self.previous_error) / dt
+
+        control_value = self.Kp * error + self.Ki * self.integral + self.Kd * derivative
+
+        self.previous_error = error
+        self.last_time = current_time
+
+        return control_value
+
+    def adjust_gains(self, error, dt):
+        error_magnitude = abs(error)
+        derivative = (error - self.previous_error) / dt
+        derivative_magnitude = abs(derivative)
+
+        self.Kp = self.base_Kp * (1 + 0.5 * error_magnitude / max(self.setpoint, 1))
+        self.Kd = self.base_Kd * (1 + 0.5 * derivative_magnitude / max(error_magnitude, 1))
+
+        self.Kp = max(0.1 * self.base_Kp, min(10 * self.base_Kp, self.Kp))
+        self.Kd = max(0.1 * self.base_Kd, min(10 * self.base_Kd, self.Kd))
 
 class DroneController:
     def __init__(self, port='COM3', baudrate=9600):
-        # Initialize the application with default port and baud rate
         self.port = port
         self.baudrate = baudrate
-        
-        # Create the main Tkinter window
-        self.root = tk.Tk()
-        self.root.title("Drone Control")
-        self.root.geometry("900x700")  # Set default window size
-        self.root.configure(bg="#1C1C1C")  # Set dark theme background
-
-        self.load_icons()  # Load button icons
-
-        # Initialize key variables
-        self.status_var = tk.StringVar(value="Idle")
+        self.arduino = None
         self.landing_in_progress = False
-        self.rotor_speed = tk.DoubleVar(value=0)  # Placeholder for real-time rotor speed
-        self.battery_level = tk.DoubleVar(value=0)  # Placeholder for real-time battery level
+        self.in_flight = False
 
-        self.arduino = None  # Serial communication placeholder
-        self.create_gui()  # Create the GUI components
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)  # Handle closing behavior
-        self.root.mainloop()  # Start the Tkinter event loop
+        self.pid_controller = PIDController(Kp=1.0, Ki=0.0, Kd=0.1)
+        self.desired_altitude = 0
+        self.current_altitude = 0
 
-    def load_icons(self):
-        # Load icons for takeoff and land buttons with error handling
+        self.command_history = []
+        self.command_queue = queue.Queue()
+        self.last_ai_suggestion = ''
+        self.command_index = None  # For navigating command history
+        self.shortcuts = {}  # For custom shortcuts
+        self.offline_command_queue = []  # For offline mode
+        self.connected = False
+        self.run_gui_interface()
+        self.start_altitude_thread()
+
+    def connect_to_drone(self):
         try:
-            self.takeoff_icon = PhotoImage(file="takeoff_icon.png").subsample(3, 3)
-        except tk.TclError:
-            self.takeoff_icon = None  # Default to no icon if not found
-        
-        try:
-            self.land_icon = PhotoImage(file="land_icon.png").subsample(3, 3)
-        except tk.TclError:
-            self.land_icon = None  # Default to no icon if not found
+            self.arduino = serial.Serial(self.port, self.baudrate, timeout=1)
+            self.update_status("Connected")
+            self.log_message("Connected to drone.")
+            self.connected = True
+            self.process_offline_commands()
+        except serial.SerialException as e:
+            self.log_message(f"Connection failed: {e}")
+            self.connected = False
+            raise e
 
-    def create_gui(self):
-        # Set up the main frame for the UI
-        main_frame = tk.Frame(self.root, bg="#1C1C1C")
-        main_frame.pack(pady=20, padx=20, fill="both", expand=True)
-
-        # Create left and right sections in the main frame
-        left_frame = tk.Frame(main_frame, bg="#2B2B2B")
-        left_frame.grid(row=0, column=0, sticky="nswe", padx=20)
-
-        right_frame = tk.Frame(main_frame, bg="#2B2B2B")
-        right_frame.grid(row=0, column=1, sticky="nswe", padx=20)
-
-        main_frame.columnconfigure(0, weight=2)  # Allocate more space to the left frame
-        main_frame.columnconfigure(1, weight=1)  # Right frame takes less space
-        main_frame.rowconfigure(0, weight=1)
-
-        # Create control section with buttons and sliders
-        self.create_control_section(left_frame)
-        # Create gauge section with rotor speed and battery level displays
-        self.create_gauge_section(right_frame)
-
-        # Status bar to display connection and operation statuses
-        self.status_label = tk.Label(self.root, textvariable=self.status_var, font=("Courier", 14), bg="#1C1C1C", fg="#F2F2F2")
-        self.status_label.pack(pady=5)
-
-        # Project label as a footer to personalize the UI
-        self.project_label = tk.Label(self.root, text="Projekt Puszczyk", font=("Courier", 10, "italic"), bg="#1C1C1C", fg="#A6A6A6")
-        self.project_label.place(anchor='sw', x=20, y=680)
-
-    def create_control_section(self, frame):
-        # Label and slider for adjusting and displaying altitude
-        self.altitude_label = tk.Label(frame, text="Altitude (cm)", font=("Courier", 14, "bold"), bg="#2B2B2B", fg="#F2F2F2")
-        self.altitude_label.pack(pady=5)
-
-        self.altitude_slider = ttk.Scale(frame, from_=0, to=400, orient='horizontal', length=350,
-                                         command=self.update_altitude_display, style="TScale")
-        self.altitude_slider.pack(pady=10)
-
-        self.current_altitude_label = tk.Label(frame, text="Current Altitude: 0 cm", font=("Courier", 12), bg="#2B2B2B", fg="#F2F2F2")
-        self.current_altitude_label.pack(pady=5)
-
-        # Create buttons for control actions (e.g., takeoff, land)
-        self.create_control_buttons(frame)
-
-    def create_control_buttons(self, frame):
-        # Takeoff button with attached icon and command
-        self.takeoff_button = tk.Button(frame, text="Takeoff", image=self.takeoff_icon, compound='left',
-                                        command=self.confirm_takeoff, font=("Courier", 12), bg="#3498DB", fg="white",
-                                        height=3, width=18, bd=2, activebackground="#2980B9")
-        self.takeoff_button.pack(pady=5)
-
-        # Land button with attached icon and command
-        self.land_button = tk.Button(frame, text="Land", image=self.land_icon, compound='left', 
-                                     command=self.confirm_land, font=("Courier", 12), bg="#E74C3C", fg="white",
-                                     height=3, width=18, bd=2, activebackground="#C0392B")
-        self.land_button.pack(pady=5)
-
-        # Connect button for initializing Arduino connection
-        self.connect_button = tk.Button(frame, text="Connect to Arduino", command=self.confirm_connect,
-                                        font=("Courier", 12), bg="#2ECC71", fg="white", height=3, width=18,
-                                        bd=2, activebackground="#27AE60")
-        self.connect_button.pack(pady=5)
-
-        # Disconnect button to safely close the Arduino connection
-        self.disconnect_button = tk.Button(frame, text="Disconnect", command=self.confirm_disconnect,
-                                           font=("Courier", 12), bg="#95A5A6", fg="white", height=3, width=18,
-                                           bd=2, activebackground="#7F8C8D")
-        self.disconnect_button.pack(pady=5)
-
-    def create_gauge_section(self, frame):
-        # Create a container for the rotor speed gauge
-        rotor_speed_container = tk.Frame(frame, bg="#2B2B2B")
-        rotor_speed_container.grid(row=0, column=0, padx=20, pady=15)
-
-        self.rotor_speed_canvas = tk.Canvas(rotor_speed_container, width=250, height=250, bg="#2B2B2B", highlightthickness=0)
-        self.rotor_speed_canvas.pack()
-
-        # Label and value display for rotor speed
-        self.rotor_speed_label = tk.Label(rotor_speed_container, text="Rotor Speed", font=("Courier", 12, "bold"), bg="#2B2B2B", fg="#E91E63")
-        self.rotor_speed_label.pack(pady=5)
-        
-        self.rotor_speed_value = tk.Label(rotor_speed_container, text="0.0 RPS", font=("Courier", 12), bg="#2B2B2B", fg="#F2F2F2")
-        self.rotor_speed_value.pack()
-
-        self.update_rotor_gauge(0)
-
-        # Create a container for the battery level gauge
-        battery_container = tk.Frame(frame, bg="#2B2B2B")
-        battery_container.grid(row=1, column=0, padx=20, pady=15)
-
-        self.battery_gauge_canvas = tk.Canvas(battery_container, width=250, height=250, bg="#2B2B2B", highlightthickness=0)
-        self.battery_gauge_canvas.pack()
-
-        # Label and value display for battery level
-        self.battery_label = tk.Label(battery_container, text="Battery Level", font=("Courier", 12, "bold"), bg="#2B2B2B", fg="#00E676")
-        self.battery_label.pack(pady=5)
-        
-        self.battery_value = tk.Label(battery_container, text="0% Battery", font=("Courier", 12), bg="#2B2B2B", fg="#F2F2F2")
-        self.battery_value.pack()
-
-        self.update_battery_gauge(0)
-
-    def update_rotor_gauge(self, rps):
-        """Update the rotor speed gauge based on the given RPS (rotations per second)."""
-        self.rotor_speed_canvas.delete("all")  # Clear previous drawings
-        radius = 110
-        center_x, center_y = 125, 125
-
-        # Calculate angle for the gauge needle
-        angle = (rps / 60.0) * 360
-        end_x = center_x + radius * math.cos(math.radians(angle - 90))
-        end_y = center_y + radius * math.sin(math.radians(angle - 90))
-        self.rotor_speed_canvas.create_line(center_x, center_y, end_x, end_y, fill="#E91E63", width=4)
-
-        # Draw the circular gauge
-        self.rotor_speed_canvas.create_oval(center_x - radius, center_y - radius, center_x + radius, center_y + radius, 
-                                            outline="#444", width=8)
-
-        self.rotor_speed_value.config(text=f"{rps:.1f} RPS")  # Display the actual RPS value
-
-    def update_battery_gauge(self, percentage):
-        """Update the battery level gauge based on the given percentage."""
-        self.battery_gauge_canvas.delete("all")
-        radius = 110
-        center_x, center_y = 125, 125
-
-        # Calculate the arc length for the battery gauge
-        angle = (percentage / 100.0) * 360
-        self.battery_gauge_canvas.create_arc(center_x - radius, center_y - radius, center_x + radius, center_y + radius,
-                                             start=90, extent=-angle, outline="#00E676", style="arc", width=6)
-
-        # Draw the gauge circle
-        self.battery_gauge_canvas.create_oval(center_x - radius, center_y - radius, center_x + radius, center_y + radius, 
-                                              outline="#444", width=8)
-
-        self.battery_value.config(text=f"{percentage}% Battery")  # Display the battery level
-
-    def update_altitude_display(self, value):
-        """Updates the displayed altitude based on the slider value."""
-        altitude_cm = int(float(value))
-        self.current_altitude_label.config(text=f"Current Altitude: {altitude_cm} cm")
-        self.send_altitude(altitude_cm)
-
-    def send_altitude(self, value):
-        """Send the altitude setting to the drone via serial communication."""
-        if self.arduino:
-            altitude_cm = f"{value}\n"
-            try:
-                self.arduino.write(altitude_cm.encode())
-            except Exception as e:
-                print(f"Error sending altitude: {e}")
-
-    def confirm_takeoff(self):
-        """Prompt the user to confirm the takeoff action."""
-        if messagebox.askyesno("Takeoff", "Do you want to initiate takeoff?"):
-            self.takeoff()
-
-    def takeoff(self):
-        """Send the takeoff command to the drone."""
-        if not self.landing_in_progress:
-            self.send_command(b'TAKEOFF\n', "Takeoff")
-
-    def confirm_land(self):
-        """Prompt the user to confirm the landing action."""
-        if messagebox.askyesno("Confirm Landing", "Are you sure you want to land?"):
-            self.landing_in_progress = True
-            self.initiate_safe_landing()
-
-    def initiate_safe_landing(self):
-        """Execute safe landing by adjusting rotor speed based on altitude feedback."""
-        if self.arduino:
-            try:
-                self.update_status("Initiating safe landing...")
-                while True:
-                    self.arduino.write(b'GET_DISTANCE\n')
-                    distance_response = self.arduino.readline().decode().strip()
-
-                    try:
-                        distance = float(distance_response)
-                        if distance <= 10:  # When close to the ground, land
-                            self.send_command(b'LAND\n', "Landed safely")
-                            self.update_status("Landed safely.")
-                            break
-                        else:  # Gradually decrease rotor speed
-                            adjusted_speed = max(0, int((distance / 400) * 60))
-                            self.send_command(f'SET_SPEED {adjusted_speed}\n'.encode(), f"Adjusting speed to {adjusted_speed} RPS")
-                    except ValueError:
-                        print(f"Invalid distance reading: {distance_response}")
-                    
-                    time.sleep(0.3)  # Adjust interval for smooth control
-            except Exception as e:
-                print(f"Error during landing: {e}")
-                self.update_status("Landing error!")
-
-    def confirm_connect(self):
-        """Prompt the user to confirm connecting to Arduino."""
-        if messagebox.askyesno("Connect to Arduino", "Do you want to connect to the Arduino?"):
-            self.connect_to_arduino()
-
-    def confirm_disconnect(self):
-        """Prompt the user to confirm disconnecting from Arduino."""
-        if messagebox.askyesno("Disconnect", "Are you sure you want to disconnect from the Arduino?"):
-            self.disconnect_arduino()
-
-    def connect_to_arduino(self):
-        """Initialize connection to Arduino in a separate thread to avoid blocking."""
-        threading.Thread(target=self.connect_to_arduino_thread, args=(self.port, self.baudrate), daemon=True).start()
-
-    def connect_to_arduino_thread(self, port, baudrate):
-        """Handle serial connection to Arduino, retry if necessary."""
-        if self.arduino is None:
-            try:
-                self.arduino = serial.Serial(port, baudrate, timeout=1)
-                self.update_status("Connected to Arduino.")
-                self.update_values()  # Start periodic updates
-            except serial.SerialException as e:
-                self.update_status(f"Error connecting: {e}. Please retry.")
-                time.sleep(1)
-
-    def disconnect_arduino(self):
-        """Close the serial connection to Arduino."""
+    def disconnect_drone(self):
         if self.arduino:
             self.arduino.close()
-            self.update_status("Disconnected from Arduino.")
             self.arduino = None
+            self.in_flight = False
+            self.landing_in_progress = False
+            self.connected = False
+            self.update_status("Disconnected")
+            self.log_message("Disconnected from drone.")
 
-    def update_values(self):
-        """Periodically request data from the Arduino, such as battery level and rotor speed."""
-        if self.arduino:
-            try:
-                # Fetch battery level from Arduino
-                self.arduino.write(b'GET_BATTERY\n')
-                battery_response = self.arduino.readline().decode().strip()
-                if battery_response:
-                    battery_level = int(battery_response)
-                    self.smooth_gauge_update(self.battery_level.get(), battery_level, self.update_battery_gauge)
-                    self.battery_level.set(battery_level)
+    def send_command(self, command, message):
+        try:
+            if self.arduino:
+                self.arduino.write(command.encode('utf-8'))
+            self.log_message(message)
+        except Exception as e:
+            self.log_message(f"Error: {e}")
+            logging.error(f"Error sending command: {e}")
 
-                # Fetch rotor speed from Arduino
-                self.arduino.write(b'GET_ROTOR_SPEED\n')
-                rotor_response = self.arduino.readline().decode().strip()
-                if rotor_response:
-                    rps = float(rotor_response)
-                    self.smooth_gauge_update(self.rotor_speed.get(), rps, self.update_rotor_gauge)
-                    self.rotor_speed.set(rps)
+    def takeoff(self):
+        if not self.landing_in_progress:
+            self.in_flight = True
+            if self.connected:
+                self.send_command('TAKEOFF\n', "Takeoff initiated")
+            else:
+                self.queue_offline_command('TAKEOFF', "Takeoff queued")
+            self.update_status("In Flight")
 
-                self.root.after(1000, self.update_values)  # Schedule next update
+    def land(self):
+        if self.in_flight:
+            self.landing_in_progress = True
+            if self.connected:
+                self.send_command('LAND\n', "Landing initiated")
+            else:
+                self.queue_offline_command('LAND', "Landing queued")
+            self.in_flight = False
+            self.update_status("Landing")
 
-            except Exception as e:
-                print(f"Error updating values: {e}")
+    def update_altitude(self, altitude):
+        self.desired_altitude = altitude
+        self.pid_controller.setpoint = altitude
+        if self.connected:
+            self.log_message(f"Altitude set to {altitude} cm")
+        else:
+            self.queue_offline_command(f'SET_ALTITUDE {altitude}', f"Altitude set to {altitude} cm queued")
 
-    def smooth_gauge_update(self, current_value, target_value, update_function):
-        """Smoothly transitions to a target value for gauges."""
-        step = (target_value - current_value) / 20
-        if abs(step) < 0.1:
-            step = target_value - current_value
+    def check_battery_status(self):
+        battery_status = random.randint(0, 100)
+        self.log_message(f"Battery status: {battery_status}%")
+        self.update_battery_gauge(battery_status)
 
-        current_value += step
-        if abs(current_value - target_value) > 0.1:
-            self.root.after(50, lambda: self.smooth_gauge_update(current_value, target_value, update_function))
-        update_function(current_value)
+    def calibrate_sensors(self):
+        self.log_message("Calibrating sensors...")
+        time.sleep(0.5)  # Reduced calibration time for speed
+        self.log_message("Sensors calibrated successfully.")
 
-    def send_command(self, command, action_name):
-        """Send a command to Arduino and update status."""
-        if self.arduino:
-            try:
-                self.arduino.write(command)
-                self.update_status(f"{action_name} initiated.")
-            except Exception as e:
-                print(f"Error sending {action_name.lower()} command: {e}")
+    def log_status(self):
+        log_entry = f"Altitude: {self.current_altitude} cm, Battery: {random.randint(0, 100)}%, Speed: {random.randint(0, 1000)} RPM"
+        self.log_message(f"Status logged: {log_entry}")
+        with open('drone_status_log.txt', 'a') as log_file:
+            log_file.write(f"{time.ctime()}: {log_entry}\n")
 
-    def update_status(self, message):
-        """Update the status display at the bottom of the UI."""
-        self.status_var.set(message)
-        print(message)
+    def set_condition(self, condition):
+        self.command_queue.put(condition)
+        self.log_message(f"Condition set: {condition}")
+
+    def start_altitude_thread(self):
+        threading.Thread(target=self.altitude_control_loop, daemon=True).start()
+
+    def altitude_control_loop(self):
+        while True:
+            if self.in_flight and self.connected:
+                control_signal = self.pid_controller.update(self.current_altitude)
+                self.send_command(f'SET_THRUST {control_signal}\n', f"Adjusting thrust: {control_signal}")
+            time.sleep(0.05)  # Increased loop frequency for faster response
+
+    def run_gui_interface(self):
+        self.root = tk.Tk()
+        self.root.title("Drone Command Interface")
+        self.root.geometry("1000x700")
+        self.root.configure(bg="#0F0F0F")
+
+        self.terminal = scrolledtext.ScrolledText(self.root, wrap=tk.WORD, width=70, height=15, bg="#0F0F0F", fg="#00FF00", font=("Courier", 12), insertbackground="#00FF00")
+        self.terminal.pack(pady=10)
+        self.terminal.bind("<Return>", self.process_terminal_command)
+        self.terminal.bind("<Tab>", self.auto_complete_command)
+        self.root.bind("<Up>", self.previous_command)
+        self.root.bind("<Down>", self.next_command)
+        self.root.bind("<Right>", self.insert_ai_suggestion)
+
+        self.status_label = tk.Label(self.root, text="Status: Idle", bg="#0F0F0F", fg="#00FF00", font=("Courier", 12))
+        self.status_label.pack(pady=5)
+
+        self.battery_gauge = Canvas(self.root, width=200, height=200, bg="#0F0F0F", highlightthickness=0)
+        self.battery_gauge.pack(side=tk.LEFT, padx=20)
+        self.update_battery_gauge(100)
+
+        self.rotor_speed_gauge = Canvas(self.root, width=200, height=200, bg="#0F0F0F", highlightthickness=0)
+        self.rotor_speed_gauge.pack(side=tk.RIGHT, padx=20)
+        self.update_rotor_speed_gauge(0)
+
+        self.altitude_label = tk.Label(self.root, text="Altitude: 0 cm", bg="#0F0F0F", fg="#00FF00", font=("Courier", 12))
+        self.altitude_label.pack(pady=5)
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.root.mainloop()
+
+    def process_terminal_command(self, event):
+        command = self.terminal.get("end-2l", "end-1c").strip()
+        if command:
+            self.terminal.insert(tk.END, "\n")
+            self.command_history.append(command)
+            self.command_index = None
+
+            if command.startswith('/alias '):
+                try:
+                    alias, original_command = command.split(' ')[1:]
+                    self.aliases[alias] = original_command
+                    self.log_message(f"Alias set: {alias} -> {original_command}")
+                except ValueError:
+                    self.log_message("Invalid alias format. Usage: /alias <alias> <command>")
+            elif command.startswith('/bind '):
+                try:
+                    shortcut, original_command = command.split(' ')[1:]
+                    self.shortcuts[shortcut] = original_command
+                    self.log_message(f"Shortcut set: {shortcut} -> {original_command}")
+                except ValueError:
+                    self.log_message("Invalid bind format. Usage: /bind <key> <command>")
+            elif command in self.shortcuts:
+                self.process_terminal_command_internal(self.shortcuts[command])
+            elif command == '/help':
+                self.display_help()
+            elif command == '/takeoff':
+                self.takeoff()
+            elif command == '/land':
+                self.land()
+            elif command.startswith('/altitude '):
+                try:
+                    altitude = int(command.split()[1])
+                    self.update_altitude(altitude)
+                except (IndexError, ValueError):
+                    self.log_message("Invalid altitude value. Usage: /altitude <value>")
+            elif command == '/connect':
+                self.connect_to_drone()
+            elif command == '/disconnect':
+                self.disconnect_drone()
+            elif command.startswith('/condition '):
+                try:
+                    condition = command.split(' ', 1)[1]
+                    self.set_condition(condition)
+                except IndexError:
+                    self.log_message("Usage: /condition <condition>")
+            elif command == '/battery_status':
+                self.check_battery_status()
+            elif command == '/calibrate':
+                self.calibrate_sensors()
+            elif command == '/log_status':
+                self.log_status()
+            elif command == '/ai_suggest':
+                suggestion = self.ai_suggest_command()
+                self.last_ai_suggestion = suggestion
+                self.log_message(f"AI Suggestion: {suggestion}")
+            elif command == '/reset':
+                self.reset_terminal()
+            elif command == '/clear':
+                self.clear_terminal()
+            else:
+                self.log_message(f"Unknown command: {command}")
+
+        self.terminal.insert(tk.END, "\n")
+        self.lock_cursor_position()
+
+    def process_terminal_command_internal(self, command):
+        self.terminal.insert(tk.END, f"{command}\n")
+        self.process_terminal_command(None)
+
+    def previous_command(self, event):
+        if self.command_history:
+            if self.command_index is None:
+                self.command_index = len(self.command_history)
+            if self.command_index > 0:
+                self.command_index -= 1
+                previous_command = self.command_history[self.command_index]
+                self.terminal.delete("end-1l", "end-1c")
+                self.terminal.insert(tk.END, previous_command)
+                self.lock_cursor_position()
+
+    def next_command(self, event):
+        if self.command_history:
+            if self.command_index is not None and self.command_index < len(self.command_history) - 1:
+                self.command_index += 1
+                next_command = self.command_history[self.command_index]
+                self.terminal.delete("end-1l", "end-1c")
+                self.terminal.insert(tk.END, next_command)
+            else:
+                self.command_index = len(self.command_history)
+                self.terminal.delete("end-1l", "end-1c")
+            self.lock_cursor_position()
+
+    def insert_ai_suggestion(self, event):
+        if self.last_ai_suggestion:
+            # Clear current input line and insert the AI suggestion
+            self.terminal.delete("end-2l", "end-1l")
+            self.terminal.insert(tk.END, self.last_ai_suggestion + "\n")
+            self.lock_cursor_position()
+
+    def auto_complete_command(self, event):
+        command_prefix = self.terminal.get("end-2l", "end-1c").strip()
+        matching_commands = [cmd for cmd in ["/takeoff", "/land", "/altitude", "/connect", "/disconnect", "/condition", "/battery_status", "/calibrate", "/log_status", "/reset", "/clear", "/ai_suggest"] if cmd.startswith(command_prefix)]
+        if len(matching_commands) == 1:
+            self.terminal.delete("end-2l", "end-1c")
+            self.terminal.insert(tk.END, matching_commands[0])
+        return "break"
+
+    def lock_cursor_position(self):
+        self.terminal.mark_set(tk.INSERT, "end-1c")
+        self.terminal.see(tk.INSERT)
+
+    def reset_terminal(self):
+        self.terminal.delete(1.0, tk.END)
+        self.command_history = []
+        self.command_index = None
+        self.log_message("Terminal has been reset.")
+
+    def clear_terminal(self):
+        self.terminal.delete(1.0, tk.END)
+        self.log_message("Terminal output cleared.")
+
+    def ai_suggest_command(self):
+        suggestions = ["/takeoff", "/land", "/altitude 100", "/connect", "/disconnect"]
+        return random.choice(suggestions)
+
+    def display_help(self):
+        help_text = """
+Available commands:
+/help                  - Show this help message
+/takeoff               - Initiate drone takeoff
+/land                  - Initiate drone landing
+/altitude <cm>         - Set desired altitude in cm
+/connect               - Connect to the drone
+/disconnect            - Disconnect from the drone and exit
+/condition <c>         - Set a condition for automatic actions (e.g., 'land if battery < 20%')
+/battery_status        - Get the current battery status
+/calibrate             - Calibrate the drone's sensors
+/log_status            - Log the current status (altitude, speed, battery)
+/ai_suggest            - Get an AI-generated command suggestion
+/reset                 - Reset the terminal and clear command history
+/clear                 - Clear the terminal output without resetting history
+/alias <alias> <cmd>   - Set a command alias (e.g., /alias t /takeoff)
+/bind <key> <cmd>      - Bind a shortcut key to a command
+/set_safety_altitude   - Set safety altitude for emergency landings
+/emergency_land        - Force emergency landing
+        """
+        self.log_message(help_text)
+
+    def log_message(self, message):
+        self.terminal.insert(tk.END, f"{message}\n")
+        self.terminal.see(tk.END)
+        logging.info(message)
+
+    def update_status(self, status):
+        self.status_label.config(text=f"Status: {status}")
 
     def on_closing(self):
-        """Handle the window close event safely."""
-        if self.arduino:
-            self.disconnect_arduino()  # Ensure connection is closed
-        self.root.destroy()  # Safely close the Tkinter window
+        self.disconnect_drone()
+        self.generate_mission_report()
+        self.root.destroy()
+
+    def generate_mission_report(self):
+        report = "Mission Report:\n"
+        report += f"Commands Executed: {len(self.command_history)}\n"
+        report += "\n".join(self.command_history)
+        report += "\nMission Completed Successfully."
+        with open('mission_report.txt', 'w') as report_file:
+            report_file.write(report)
+        self.log_message("Mission report generated.")
+
+    def update_battery_gauge(self, percentage):
+        self.battery_gauge.delete("all")
+        self.battery_gauge.create_oval(10, 10, 190, 190, outline="#00FF00", width=4)
+        self.battery_gauge.create_arc(10, 10, 190, 190, start=90, extent=-percentage * 3.6, outline="#00FF00", style="arc", width=8)
+        self.battery_gauge.create_text(100, 100, text=f"{percentage}%", fill="#00FF00", font=("Courier", 14))
+
+    def update_rotor_speed_gauge(self, speed):
+        self.rotor_speed_gauge.delete("all")
+        self.rotor_speed_gauge.create_oval(10, 10, 190, 190, outline="#00FF00", width=4)
+        self.rotor_speed_gauge.create_arc(10, 10, 190, 190, start=90, extent=-speed * 3.6, outline="#00FF00", style="arc", width=8)
+        self.rotor_speed_gauge.create_text(100, 100, text=f"{speed} RPM", fill="#00FF00", font=("Courier", 14))
+
+    def queue_offline_command(self, command, message):
+        self.offline_command_queue.append(command)
+        self.log_message(message)
+
+    def process_offline_commands(self):
+        while self.offline_command_queue:
+            command = self.offline_command_queue.pop(0)
+            self.send_command(command + '\n', f"Executed queued command: {command}")
+
+    def set_safety_altitude(self):
+        self.safety_altitude = 50
+        self.log_message(f"Safety altitude set to {self.safety_altitude} cm")
+
+    def emergency_land(self):
+        self.log_message("Emergency landing initiated!")
+        self.send_command('LAND\n', "Emergency landing initiated")
+        self.in_flight = False
+        self.update_status("Emergency Landing")
 
 if __name__ == "__main__":
-    DroneController()
+    try:
+        DroneController()
+    except KeyboardInterrupt:
+        print("\nExiting...")

@@ -1,0 +1,8 @@
+Mission Report:
+Commands Executed: 5
+/connect
+/help
+/disconnect
+/clear
+hej
+Mission Completed Successfully.
