@@ -1,6 +1,5 @@
 Mission Report:
-Commands Executed: 3
+Commands Executed: 2
 /help
-/connect
 /disconnect
 Mission Completed Successfully.
